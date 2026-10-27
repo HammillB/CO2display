@@ -102,14 +102,24 @@ async function ingest(request, env) {
 
 // D1's free plan allows 5,000,000 rows read per day. Each history call reads every row in the
 // window, so share one answer for 5 minutes at Cloudflare's edge no matter how many pages ask.
+// The stored copy keeps a long max-age so Cloudflare's own cache holds onto it, but the copy we
+// hand back to the browser says no-store: old WebViews (the frame's kiosk browser) have been seen
+// caching a "public, max-age" response far past its freshness window, which froze the chart there
+// while a normal desktop browser kept re-validating correctly.
 async function cachedHistory(request, url, env, ctx) {
   const cache = caches.default;
   const key = new Request(url.toString(), { method: "GET" });
   const hit = await cache.match(key);
-  if (hit) return hit;
+  if (hit) return noBrowserCache(hit);
   const res = await history(url, env);
   if (res.status === 200) ctx.waitUntil(cache.put(key, res.clone()));
-  return res;
+  return noBrowserCache(res);
+}
+
+function noBrowserCache(res) {
+  const out = new Response(res.body, res);
+  out.headers.set("cache-control", "no-store");
+  return out;
 }
 
 function tzOf(env) {
