@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Classroom CO2</title>
+<style>
+  /* Written for an old Android 6 WebView: no CSS variables, no grid, no ES6. */
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+  body {
+    background: #0e1116;
+    color: #e8ecf1;
+    font-family: Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  #wrap {
+    display: -webkit-flex; display: flex;
+    -webkit-flex-direction: column; flex-direction: column;
+    height: 100%;
+  }
+
+  /* Top panel: the whole thing changes color with the CO2 band, readable from across the room. */
+  #panel {
+    -webkit-flex: 0 0 auto; flex: 0 0 auto;
+    position: relative;
+    padding: 2.5vmin 4vmin 2vmin 4vmin;
+    text-align: center;
+    background: #5b6370; color: #ffffff;
+  }
+  #panel.b-good   { background: #3ddc84; color: #08210f; }
+  #panel.b-ok     { background: #ffd23f; color: #2a2200; }
+  #panel.b-stuffy { background: #ff9f1c; color: #2b1700; }
+  #panel.b-bad    { background: #d00000; color: #ffffff; }
+  #panel.b-stale  { background: #5b6370; color: #ffffff; }
+
+  #title {
+    font-size: 3.2vmin; font-weight: 500; letter-spacing: 0.2vmin;
+    text-transform: uppercase; opacity: 0.85;
+  }
+  #reading { line-height: 1; margin-top: 0.5vmin; }
+  #num { font-size: 27vmin; font-weight: 700; letter-spacing: -0.5vmin; }
+  #unit { font-size: 5vmin; font-weight: 400; margin-left: 1.5vmin; opacity: 0.85; }
+  #status { font-size: 6vmin; font-weight: 700; margin-top: 0.5vmin; }
+  #sub { font-size: 3vmin; margin-top: 0.8vmin; opacity: 0.85; min-height: 3.6vmin; }
+
+  /* Bottom: trend chart. */
+  #chartbox {
+    -webkit-flex: 1 1 0%; flex: 1 1 0%;
+    position: relative; min-height: 0;
+  }
+  /* Absolutely positioned so the canvas size never feeds back into the layout. */
+  #chart { position: absolute; left: 0; top: 0; display: block; }
+  #peak {
+    position: absolute; right: 3vmin; top: 1.6vmin;
+    font-size: 2.6vmin; opacity: 0.8;
+  }
+  #charttitle {
+    position: absolute; left: 3vmin; top: 1.6vmin;
+    font-size: 2.6vmin; opacity: 0.8;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="panel" class="b-stale">
+    <div id="title">Classroom CO<sub style="font-size:0.6em">2</sub></div>
+    <div id="reading"><span id="num">--</span><span id="unit">ppm</span></div>
+    <div id="status">Waiting for data</div>
+    <div id="sub">&nbsp;</div>
+  </div>
+  <div id="chartbox">
+    <div id="charttitle">Last 24 hours</div>
+    <div id="peak"></div>
+    <canvas id="chart"></canvas>
+  </div>
+</div>
+
+<script>
+(function () {
+  // ---- Settings (the chart window can be changed in the page address, e.g. ?hours=12) ----
+  var STALE_AFTER_S = 300;     // no new reading for 5 minutes -> gray "sensor offline"
+  var LATEST_EVERY_MS = 20000; // how often to ask for the newest number
+  var HISTORY_EVERY_MS = 300000;
+  var BANDS = [
+    { max: 800,      cls: 'b-good',   label: 'Fresh air' },
+    { max: 1000,     cls: 'b-ok',     label: 'Good' },
+    { max: 1500,     cls: 'b-stuffy', label: 'Getting stuffy' },
+    { max: Infinity, cls: 'b-bad',    label: 'Needs fresh air' }
+  ];
+
+  function param(name, fallback) {
+    var m = new RegExp('[?&]' + name + '=([^&]*)').exec(window.location.search);
+    return m ? decodeURIComponent(m[1].replace(/\+/g, ' ')) : fallback;
+  }
+  var HOURS = parseInt(param('hours', '24'), 10);
+  if (!(HOURS >= 1 && HOURS <= 168)) { HOURS = 24; }
+
+  var panel = document.getElementById('panel');
+  var numEl = document.getElementById('num');
+  var statusEl = document.getElementById('status');
+  var subEl = document.getElementById('sub');
+  var titleEl = document.getElementById('title');
+  var peakEl = document.getElementById('peak');
+  var chartTitleEl = document.getElementById('charttitle');
+  var canvas = document.getElementById('chart');
+
+  chartTitleEl.textContent = HOURS === 24 ? 'Last 24 hours' : ('Last ' + HOURS + ' hours');
+
+  // ---- State ----
+  var latest = null;        // {ppm, age_s, updated_label}
+  var latestFetchedAt = 0;  // Date.now() when 'latest' arrived
+  var serverReachable = true;
+  var history = null;       // response from /api/history
+
+  function bandFor(ppm) {
+    for (var i = 0; i < BANDS.length; i++) {
+      if (ppm < BANDS[i].max) { return BANDS[i]; }
+    }
+    return BANDS[BANDS.length - 1];
+  }
+
+  function commas(n) {
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  function get(url, done) {
+    // No cache-busting param here: /api/history is meant to be shared from the Worker's
+    // edge cache across every open page, and a changing query string would defeat that.
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.timeout = 10000;
+    xhr.onload = function () {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        var data = null;
+        try { data = JSON.parse(xhr.responseText); } catch (e) {}
+        done(data);
+      } else { done(null); }
+    };
+    xhr.onerror = function () { done(null); };
+    xhr.ontimeout = function () { done(null); };
+    xhr.send();
+  }
+
+  function fetchLatest() {
+    get('/api/latest', function (data) {
+      serverReachable = !!data;
+      if (data && data.ppm !== null && data.ppm !== undefined) {
+        latest = data;
+        latestFetchedAt = Date.now();
+      }
+      render();
+    });
+  }
+
+  function fetchHistory() {
+    get('/api/history?hours=' + HOURS, function (data) {
+      if (data && data.points) { history = data; }
+      drawChart();
+    });
+  }
+
+  // How old the newest reading is, measured with the server's age plus time elapsed here,
+  // so a wrong clock on the frame cannot cause a false "offline".
+  function currentAgeS() {
+    if (!latest) { return null; }
+    var elapsed = Math.max(0, (Date.now() - latestFetchedAt) / 1000);
+    return latest.age_s + elapsed;
+  }
+
+  function agoText(s) {
+    s = Math.round(s);
+    if (s < 90) { return s + ' sec ago'; }
+    var m = Math.round(s / 60);
+    if (m < 90) { return m + ' min ago'; }
+    var h = Math.floor(m / 60);
+    return h + ' h ' + (m % 60) + ' min ago';
+  }
+
+  function setClass(cls) {
+    panel.className = cls;
+  }
+
+  function render() {
+    if (!latest) {
+      setClass('b-stale');
+      numEl.textContent = '--';
+      statusEl.textContent = serverReachable ? 'Waiting for data' : "Can't reach the server";
+      subEl.innerHTML = '&nbsp;';
+      return;
+    }
+    var age = currentAgeS();
+    var stale = age > STALE_AFTER_S;
+    numEl.textContent = commas(latest.ppm);
+    if (stale) {
+      setClass('b-stale');
+      statusEl.textContent = 'No new data for ' + Math.round(age / 60) + ' min';
+      subEl.textContent = 'Sensor may be offline. Last reading ' + commas(latest.ppm) + ' ppm at ' + latest.updated_label;
+    } else {
+      var b = bandFor(latest.ppm);
+      setClass(b.cls);
+      statusEl.textContent = b.label;
+      var msg = 'Updated ' + latest.updated_label + ' (' + agoText(age) + ')';
+      if (!serverReachable) { msg = "Can't reach the server, showing the last reading. " + msg; }
+      subEl.textContent = msg;
+    }
+  }
+
+  // ---- Trend chart (canvas, ES5) ----
+  function drawChart() {
+    var box = canvas.parentNode;
+    var cssW = box.clientWidth - 0;
+    var cssH = box.clientHeight - 0;
+    if (cssW < 50 || cssH < 50) { return; }
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    var ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    var base = Math.min(cssW, cssH);
+    var fs = Math.max(12, Math.round(base * 0.035));
+    ctx.font = fs + 'px Roboto, Arial, sans-serif';
+
+    var padL = fs * 3.6, padR = fs * 0.8, padT = fs * 2.4, padB = fs * 1.9;
+    var plotW = cssW - padL - padR;
+    var plotH = cssH - padT - padB;
+
+    if (!history || !history.points || history.points.length === 0) {
+      ctx.fillStyle = '#8b94a3';
+      ctx.textAlign = 'center';
+      ctx.fillText('No history yet', cssW / 2, cssH / 2);
+      peakEl.textContent = '';
+      return;
+    }
+
+    var pts = history.points;
+    var t0 = history.start, t1 = history.end;
+    var maxV = 0, i;
+    for (i = 0; i < pts.length; i++) { if (pts[i][1] > maxV) { maxV = pts[i][1]; } }
+    var yMin = 400;
+    var yMax = Math.max(1600, Math.ceil((maxV + 100) / 400) * 400);
+
+    function X(t) { return padL + (t - t0) / (t1 - t0) * plotW; }
+    function Y(v) { return padT + (1 - (v - yMin) / (yMax - yMin)) * plotH; }
+
+    // threshold lines
+    var marks = [
+      { v: 800,  c: 'rgba(61,220,132,0.55)' },
+      { v: 1000, c: 'rgba(255,210,63,0.6)' },
+      { v: 1500, c: 'rgba(255,90,90,0.65)' }
+    ];
+    ctx.lineWidth = 1;
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    for (i = 0; i < marks.length; i++) {
+      if (marks[i].v > yMax) { continue; }
+      var y = Math.round(Y(marks[i].v)) + 0.5;
+      ctx.strokeStyle = marks[i].c;
+      ctx.setLineDash ? ctx.setLineDash([6, 6]) : 0;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+      ctx.setLineDash ? ctx.setLineDash([]) : 0;
+      ctx.fillStyle = '#aab3c0';
+      ctx.fillText(commas(marks[i].v), padL - fs * 0.5, y);
+    }
+    // baseline label
+    ctx.fillStyle = '#6f7887';
+    ctx.fillText('400', padL - fs * 0.5, Y(400) - 1);
+
+    // time ticks
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    var ticks = history.ticks || [];
+    for (i = 0; i < ticks.length; i++) {
+      var x = Math.round(X(ticks[i].t)) + 0.5;
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+      ctx.fillStyle = '#aab3c0';
+      ctx.fillText(ticks[i].label, x, padT + plotH + fs * 0.35);
+    }
+
+    // data: break the line where data is missing
+    var gap = Math.max(history.bucket_s * 2.5, 300);
+    var started = false, lastT = 0;
+    ctx.strokeStyle = '#7cc4ff';
+    ctx.lineWidth = Math.max(2, Math.round(base * 0.006));
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    for (i = 0; i < pts.length; i++) {
+      var px = X(pts[i][0]), py = Y(pts[i][1]);
+      if (!started || pts[i][0] - lastT > gap) { ctx.moveTo(px, py); }
+      else { ctx.lineTo(px, py); }
+      started = true;
+      lastT = pts[i][0];
+    }
+    ctx.stroke();
+
+    // peak text
+    if (history.peak) {
+      peakEl.textContent = 'Peak ' + commas(history.peak.ppm) + ' ppm, ' + history.peak.label;
+    } else {
+      peakEl.textContent = '';
+    }
+  }
+
+  // ---- Go ----
+  fetchLatest();
+  fetchHistory();
+  setInterval(fetchLatest, LATEST_EVERY_MS);
+  setInterval(fetchHistory, HISTORY_EVERY_MS);
+  setInterval(render, 1000);
+  window.addEventListener('resize', drawChart);
+  window.addEventListener('orientationchange', function () { setTimeout(drawChart, 300); });
+})();
+</script>
+</body>
+</html>

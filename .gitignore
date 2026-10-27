@@ -1,0 +1,4 @@
+.wrangler/
+node_modules/
+INGEST_SECRET.local.txt
+*.local.txt

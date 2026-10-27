@@ -1,0 +1,29 @@
+name = "classroom-co2"
+main = "src/index.js"
+compatibility_date = "2026-10-23"
+
+# Serve the Worker on a subdomain of fittheline.com (the school network blocks *.workers.dev).
+# Wrangler creates the DNS record and certificate on the first deploy. The domain must be
+# in the same Cloudflare account you log in with.
+routes = [{ pattern = "co2.fittheline.com", custom_domain = true }]
+
+# The display page in ./public is served for every path except /api/*,
+# which always goes to the Worker.
+[assets]
+directory = "./public"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "classroom-co2"
+# Paste the id printed by:  npx wrangler d1 create classroom-co2
+database_id = "822f1c5d-40a8-405b-8055-8fa3640fa59e"
+
+[vars]
+# Time zone for the clock labels on the display (the frame's own clock is not used).
+TIMEZONE = "America/Denver"
+# How many days of readings to keep.
+RETENTION_DAYS = "7"
+
+# Also needed, but NOT stored in this file:
+#   npx wrangler secret put INGEST_SECRET
